@@ -1,0 +1,552 @@
+# Formal Analysis of the GLE / VARX Forecasting Pipeline
+### Mathematical · Physical · Financial · Statistical · Computational — applied generically to FX (USD/INR), Brent crude and Gold
+
+| | |
+|---|---|
+| **Object analysed** | `gle_pipeline.py` (single-file pipeline: data alignment → exponential-memory elastic net → GARCH(1,1)-t → Monte Carlo forecast → walk-forward / density / CRPS / regularization / frozen-forward evaluation → HTML dashboards) |
+| **Analysis date** | 2026-10-30 |
+| **Method of analysis** | Static, line-by-line reading of the source; algebraic re-derivation of every formula the script states or implements; comparison with the primary literature. |
+| **What this document is not** | The script was **not executed** and **no market data were inspected**. This document therefore makes **no empirical claim** about USD/INR, Brent or Gold forecast skill. Every statement about performance is conditional or taken from the cited literature. |
+| **Link policy** | Links were taken from bibliographic records. Those marked ✅ were opened and confirmed during preparation. Run a link checker (e.g. [lychee](https://github.com/lycheeverse/lychee)) in CI before publishing. |
+
+---
+
+## Table of Contents
+1. [Executive summary](#1-executive-summary)
+2. [Asset-general formulation](#2-asset-general-formulation)
+3. [Mathematical analysis](#3-mathematical-analysis)
+4. [Physical analysis (Mori–Zwanzig / GLE)](#4-physical-analysis-morizwanzig--gle)
+5. [Financial and economic analysis](#5-financial-and-economic-analysis)
+6. [Statistical analysis of the evaluation design](#6-statistical-analysis-of-the-evaluation-design)
+7. [Computational and data analysis](#7-computational-and-data-analysis)
+8. [Verification ledger (what was re-derived and found consistent)](#8-verification-ledger)
+9. [Implementation observations and limitations](#9-implementation-observations-and-limitations)
+10. [Extensions and recommendations](#10-extensions-and-recommendations)
+11. [Reproducibility checklist](#11-reproducibility-checklist)
+12. [References](#12-references)
+
+---
+
+## 1. Executive summary
+
+**What the pipeline is.** A *conditional-density forecaster* for a daily asset log-return $r_t=\ln P_t-\ln P_{t-1}$:
+
+$$
+r_{t+1}=\underbrace{b_0+\sum_{h\in\mathcal H}\beta_h s_h(t)+\sum_{j}\Omega_j x_j(t)}_{\mu_t\ \text{(elastic-net mean)}}+\underbrace{\sqrt{h_{t+1}}\,z_{t+1}}_{\eta_{t+1}\ \text{(GARCH(1,1)-}t)},\qquad s_h(t)=\lambda_h s_h(t-1)+r_t,\ \lambda_h=2^{-1/h}.
+$$
+
+**Principal findings.**
+
+1. **Internal mathematical consistency is high.** The following were re-derived independently and match the code: the exponential-mode memory kernel; the feedback matrix $A=\operatorname{diag}(\lambda)+\mathbf 1\beta^\top$ and its role in simulation stability; the Student-$t$ IRLS weights; the Clark–West loss differential; the PIT and log-score scaling under the $\times 1000$ unit change; the closed-form ensemble CRPS; the purging index arithmetic; the causal alignment of the drift benchmark; and the Monte Carlo quantile-error claim (§8).
+2. **The design philosophy is methodologically sound for a low-signal domain.** Strong L1/L2 shrinkage, time-ordered CV, a null benchmark (zero forecast), nested-model testing (Clark–West), density evaluation (PIT, log score, CRPS), purged multi-horizon targets, a selection/hold-out split, and a *frozen forward* test address the main failure modes catalogued in the exchange-rate and equity-premium forecasting literature (§5–§6).
+3. **The "GLE / Mori–Zwanzig" language is best read as a structural analogy, not a derivation** (§4). The estimated object is a distributed-lag/ARX regression with a sum-of-exponentials lag kernel, with GARCH-$t$ residuals. That is a legitimate and well-studied model class (Markovian embedding of a memory kernel; HAR-type multi-scale memory) and the script states its own identifiability limits correctly.
+4. **Expected skill is small by construction of the domain.** Daily FX, crude-oil and gold returns are close to martingale-difference sequences at the mean. The literature (Meese–Rogoff; Rossi; Rogoff–Stavrakeva; Baumeister–Kilian; Alquist–Kilian) predicts that the mean component will rarely beat a no-change forecast robustly, whereas the *variance* component (GARCH-$t$) is where reproducible gains occur (§5). The script's own report text is consistent with that expectation.
+5. **Asset generality.** The estimator, noise model and evaluation are asset-agnostic. The *drive set* is not: for Brent or Gold as target, the corresponding drive must be removed from the regressors (§2.2). The multi-asset dashboard uses the GLE/VARX model only for USD/INR; Gold and Brent use a model-free moving-block bootstrap (§7.5).
+6. **Implementation observations** (§9) are minor and do not invalidate the framework. The most visible is a label mismatch that silently drops one row from the dashboard's accuracy panel.
+
+---
+
+## 2. Asset-general formulation
+
+### 2.1 Notation
+
+For an asset $a\in\{\text{USD/INR},\ \text{Brent},\ \text{Gold}\}$ with price $P^{a}_t>0$:
+
+$$
+r^{a}_t=\ln P^{a}_t-\ln P^{a}_{t-1},\qquad R^{a}_{t\to t+H}=\sum_{k=1}^{H} r^{a}_{t+k}=\ln\frac{P^{a}_{t+H}}{P^{a}_t}.
+$$
+
+Log-returns are additive over time and approximately equal to percentage changes for small moves; they are unit-free, so the same estimator applies to *INR per USD*, *USD per barrel* and *USD per troy ounce*.
+
+### 2.2 What is asset-specific and what is not
+
+| Component | Asset-agnostic? | Asset-specific consideration |
+|---|---|---|
+| Mode states $s_h$, elastic net, GARCH-$t$, simulation, CW/PIT/CRPS | Yes | Hyper-parameters (half-lives, $\nu$, persistence) will differ by asset |
+| Drive set $\{x_j\}$ | **No** | For target = Brent, drop `brent_oil_r`; for target = Gold, drop `gold_r`. Otherwise $x_j(t)=r_t$ and the regressor duplicates the target's own contemporaneous return, producing exact collinearity with the fast memory modes (e.g. $s_{h=1}$ contains $r_t$) |
+| Data construction | **No** | FX: spot/fixing and time-zone; Brent: roll-adjusted futures, not spot; Gold: spot or LBMA/futures fixing |
+| Calendar | **No** | `pd.bdate_range` has no holiday calendar (§9) |
+| Economic sign priors for $\Omega_j$ | **No** | See §5.4 |
+
+### 2.3 Stylized facts the model class must accommodate (all three assets)
+
+Fat tails, volatility clustering, near-zero return autocorrelation, leverage/asymmetry (strongest in equities, weaker in FX and gold; oil and gold can show *inverse* asymmetry), and regime shifts. See [Cont (2001)](https://doi.org/10.1080/713665670). The model captures the first two; asymmetry and regime shifts are outside it (§9–§10).
+
+---
+
+## 3. Mathematical analysis
+
+### 3.1 Exponential-mode memory kernel
+
+Unrolling the recursion $s_h(t)=\lambda_h s_h(t-1)+r_t$ from a zero start gives $s_h(t)=\sum_{k=0}^{t-1}\lambda_h^{k}r_{t-k}$. The mean predictor's dependence on past returns is therefore
+
+$$
+\mu^{\text{mem}}_t=\sum_{h}\beta_h s_h(t)=\sum_{k\ge 0}K_k\,r_{t-k},\qquad K_k=\sum_{h}\beta_h\lambda_h^{k}.
+$$
+
+* $K_k$ is a **sum of $|\mathcal H|$ decaying exponentials** — a Prony-type (exponential-sum) parametrization of the impulse response. With $\mathcal H=\{1,3,10,30,90\}$ it uses 5 parameters instead of one per lag.
+* The code's `kernel_wiener[str(k+1)]` stores $K_k$; "lag 1" means "today's return predicting tomorrow's" (index $k=0$). The demonstration recovery table uses the same convention for the synthetic truth. The two are consistent.
+* **Kernel sum.** $\sum_{k\ge0}K_k=\sum_h \beta_h/(1-\lambda_h)$ (geometric series; $\lambda_h\in(0,1)$). This is the cumulative response to a unit return "held forever". The code's `kernel_sum` is exactly this.
+* **Half-life semantics.** $\lambda_h^{h}=2^{-1}$, so a return $h$ days old has weight $\tfrac12$. Correct.
+* **Burn-in.** The states are initialized at zero, so $s_h(t)$ omits pre-sample weight $\lambda_h^{t}$. After `BURN_IN`=450 days the omitted weight for $h=90$ is $2^{-450/90}=2^{-5}\approx 3.1\%$. The comment "450 days $\gg$ longest half-life" is best read as "five half-lives"; the residual truncation is small but not negligible for very precise work.
+
+### 3.2 Feedback loop and stability
+
+With the drives and intercept held at zero, the stacked state obeys $S(t+1)=\lambda\odot S(t)+r_{t+1}\mathbf 1$ and $r_{t+1}=\beta^\top S(t)$, hence
+
+$$
+S(t+1)=A\,S(t),\qquad A=\operatorname{diag}(\lambda)+\mathbf 1\beta^\top .
+$$
+
+By the matrix determinant lemma,
+
+$$
+\det(zI-A)=\prod_h (z-\lambda_h)\Big[\,1-\sum_h\frac{\beta_h}{z-\lambda_h}\Big].
+$$
+
+Eigenvalues of $A$ are thus roots of $\sum_h \beta_h/(z-\lambda_h)=1$. Useful consequences:
+
+* **All $\beta_h>0$:** exactly one root exceeds $\lambda_{\max}$ and the rest interlace the $\lambda$'s in $(0,1)$. The system is stable iff the right-most root is $<1$, i.e. iff $\sum_h\beta_h/(1-\lambda_h)<1$ — the **kernel sum is below 1**.
+* **Mixed signs:** no closed form; the code evaluates the eigenvalues numerically (`stability_radius`), which is the correct general method.
+* The guard multiplies *mode* coefficients by the largest $c\in\{0.9,\dots,0\}$ that brings $\rho(A)<0.995$. The search is monotone in $c$ for the positive case and a sensible heuristic otherwise.
+
+**Long-run multiplier and variance ratio.** For stable memory with i.i.d.-like shocks, the response of the $H\to\infty$ cumulative return to a one-time shock is $1/(1-K_\Sigma)$ with $K_\Sigma=\sum_k K_k$. The long-horizon variance ratio of the *noise-driven* component therefore tends to $\mathrm{VR}(\infty)=(1-K_\Sigma)^{-2}$, a direct link to the [Lo–MacKinlay (1988)](https://doi.org/10.1093/rfs/1.1.41) variance-ratio literature: $K_\Sigma>0$ (momentum) → $\mathrm{VR}>1$; $K_\Sigma<0$ (mean reversion) → $\mathrm{VR}<1$.
+
+### 3.3 Elastic-net estimation
+
+With standardized columns $z_{tj}$ and observation weights $w_t$ (mean 1), the code solves
+
+$$
+\min_{b_0,\beta}\ \frac1{2n}\sum_t w_t\big(y_t-b_0-z_t^\top\beta\big)^2+\alpha\Big[\rho\|\beta\|_1+\tfrac{1-\rho}{2}\|\beta\|_2^2\Big]
+$$
+
+([Zou & Hastie 2005](https://doi.org/10.1111/j.1467-9868.2005.00503.x); built on the lasso of [Tibshirani 1996](https://doi.org/10.1111/j.2517-6161.1996.tb02080.x)).
+
+* **KKT conditions.** For $\beta_j\neq0$: $\tfrac1n z_j^\top W(y-Z\beta-b_0)=\alpha[\rho\,\mathrm{sign}(\beta_j)+(1-\rho)\beta_j]$; for $\beta_j=0$: $|\tfrac1n z_j^\top W(\cdot)|\le\alpha\rho$.
+* **Coordinate update** (cyclic descent used by scikit-learn; [Friedman, Hastie & Tibshirani 2010](https://doi.org/10.18637/jss.v033.i01)): $\beta_j\leftarrow S(c_j,\alpha\rho)/(d_j+\alpha(1-\rho))$ with $S$ the soft-threshold, $c_j=\tfrac1n\sum_t w_t z_{tj}\,e^{(-j)}_t$ the partial-residual correlation and $d_j=\tfrac1n\sum_t w_t z_{tj}^2$.
+* **Grid.** For the unweighted problem $\alpha_{\max}=\max_j|\tfrac1n z_j^\top(y-\bar y)|/\rho$ is the smallest penalty giving $\beta=0$; the script's integer `alphas=N_ALPHAS` builds a log-grid downward from it, so the grid adapts to the scale of $y$ (requires scikit-learn $\ge1.7$ as the header states).
+* **Grouping effect.** The $\ell_2$ term makes strongly correlated columns (here: the five mode states, which are highly correlated because they are all filters of the same $r_t$) enter together rather than arbitrarily choosing one — the correct reason to prefer elastic net to pure lasso for this design ([Zou & Hastie 2005](https://doi.org/10.1111/j.1467-9868.2005.00503.x)).
+* **Standardized coefficients.** $y$ is not standardized, so $\beta^{\text{std}}_j=\beta^{\text{raw}}_j\,\mathrm{sd}(x_j)$ is the change in $r_{t+1}$ (in return units) per one-sd change in the regressor. The code's conversion $\beta^{\text{raw}}=\beta^{\text{std}}/\texttt{scale\_}$ is correct.
+* **Bias–variance.** Shrinkage biases coefficients toward zero by construction; this is intended, because the *prediction* error — not coefficient unbiasedness — is the objective. To first order, estimating $k$ unpenalized parameters on a training sample of $R$ observations adds roughly $\sigma^2 k/R$ to out-of-sample MSE (e.g. Clark–McCracken-type arguments). With $k=12$, $R\approx2000$ this is $\approx0.6\%$ of $\sigma^2$, which exceeds the population $R^2$ one expects in daily FX; hence a null or near-null fitted model is the *rational* outcome of the CV and not a defect.
+* **Selection ≠ causation.** A surviving $\Omega_j\ne0$ means $x_j$ improves one-day-ahead linear prediction conditional on the rest. It is not a Granger-causality test with inference, and selection consistency requires conditions (irrepresentability; [Zhao & Yu 2006](https://jmlr.org/papers/v7/zhao06a.html)) that need not hold for collinear financial regressors. [Meinshausen & Bühlmann (2010)](https://doi.org/10.1111/j.1467-9868.2010.00740.x) stability selection is the standard remedy.
+* **Time-series CV.** `TimeSeriesSplit` keeps each validation block after its training block. For one-step targets (non-overlapping) this is valid; for the autoregressive case see [Bergmeir, Hyndman & Koo (2018)](https://doi.org/10.1016/j.csda.2017.11.003). For overlapping $H$-day targets, fold boundaries are not purged (§9).
+* **Theory under dependence.** Lasso-type consistency for weakly dependent, possibly heavy-tailed series is established in [Basu & Michailidis (2015)](https://doi.org/10.1214/15-AOS1315) and [Wong, Li & Tewari (2020)](https://doi.org/10.1214/19-AOS1815).
+
+### 3.4 Student-$t$ IRLS weights
+
+Write $\eta_t=\sqrt{h_t}\,z_t$ with $z_t$ a **unit-variance** Student-$t$ (as `arch` standardizes). Then $\eta_t=\sigma_{s,t}T_t$ with $T_t\sim t_\nu$ and scale $\sigma_{s,t}^2=h_t(\nu-2)/\nu$. Using the scale-mixture representation $\eta_t\mid\tau_t\sim\mathcal N(0,\sigma_{s,t}^2/\tau_t)$, $\tau_t\sim\mathrm{Gamma}(\nu/2,\nu/2)$, the E-step gives $\mathbb E[\tau_t\mid\eta_t]=(\nu+1)/(\nu+\eta_t^2/\sigma_{s,t}^2)$. The weight entering the weighted least squares is $\mathbb E[\tau_t\mid\eta_t]/\sigma_{s,t}^2$:
+
+$$
+w_t=\frac{\nu+1}{\nu\sigma_{s,t}^2+\eta_t^2}=\frac{\nu+1}{(\nu-2)h_t+\eta_t^2}=\frac{\nu+1}{(\nu-2+z_t^2)\,h_t},\qquad z_t=\eta_t/\sqrt{h_t}.
+$$
+
+This is *exactly* the formula in `fit_weighted` (with `r**2/h` $=z_t^2$ in original units). The scheme is the EM/IRLS maximum-likelihood algorithm for $t$-regression ([Lange, Little & Taylor 1989](https://doi.org/10.1080/01621459.1989.10478852)). Mean-1 normalization is harmless because scikit-learn rescales weights internally; it only fixes the meaning of $\alpha$.
+
+Pass-1 residuals come from the same data used for pass 2 (a feasible-GLS circularity, standard and asymptotically harmless). If the GARCH fit fails or yields non-finite weights the code falls back to the unweighted fit with a logged warning — correct defensive behaviour.
+
+### 3.5 GARCH(1,1)-$t$ noise model
+
+$$
+\eta_t=\sqrt{h_t}z_t,\quad h_t=\omega+\alpha\eta_{t-1}^2+\beta h_{t-1},\quad z_t\sim t_\nu\text{ standardized}
+$$
+
+([Engle 1982](https://doi.org/10.2307/1912773); [Bollerslev 1986](https://doi.org/10.1016/0304-4076(86)90063-1); $t$-innovations: [Bollerslev 1987](https://doi.org/10.2307/1925546)).
+
+* **Unconditional variance:** $\bar\sigma^2=\omega/(1-\alpha-\beta)$ if $\alpha+\beta<1$. At $\alpha+\beta\ge1$ the process is IGARCH ([Engle & Bollerslev 1986](https://doi.org/10.1080/07474938608800095)) and the script prints a warning — appropriate.
+* **Variance forecast:** $\mathbb E_T[h_{T+k}]=\bar\sigma^2+(\alpha+\beta)^{k-1}(h_{T+1}-\bar\sigma^2)$. Volatility-shock half-life $=\ln2/(-\ln(\alpha+\beta))$ days.
+* **Variance of an $H$-day cumulative return** (zero-mean, no memory feedback; cross-terms vanish because $\eta$ is a martingale difference):
+$\ \mathrm{Var}_T(R_{T\to T+H})=H\bar\sigma^2+(h_{T+1}-\bar\sigma^2)\dfrac{1-(\alpha+\beta)^H}{1-(\alpha+\beta)}$. This is why bands widen faster than $\sqrt H$ after turbulent days and slower after calm ones.
+* **Kurtosis:** with $\kappa_z=3(\nu-2)/(\nu-4)$ for $\nu>4$, the unconditional kurtosis of $\eta$ is $\kappa_z\,\dfrac{1-(\alpha+\beta)^2}{1-(\alpha+\beta)^2-\alpha^2(\kappa_z-1)}$, finite only if the denominator is positive ([Bollerslev 1986](https://doi.org/10.1016/0304-4076(86)90063-1)). For Gaussian $z$ ($\kappa_z=3$) this reduces to the textbook $3(1-(\alpha+\beta)^2)/(1-\beta^2-2\alpha\beta-3\alpha^2)$.
+* **Estimation.** Quasi-/maximum likelihood; the $\times1000$ rescaling changes units only, with $\omega\to10^{6}\omega$ and $h\to10^{6}h$ in scaled units (conditional on this the code consistently converts back with $/\texttt{GARCH\_SCALE}$ for $\sigma$ and uses scaled $\omega,\alpha,\beta$ with scaled shocks in simulation). Consistency of Gaussian QMLE does not require correct innovation law ([Bollerslev & Wooldridge 1992](https://doi.org/10.1080/07474939208800229)); with $t$-likelihood it is a full ML under the maintained assumption.
+* **Benchmark status.** GARCH(1,1) is a hard-to-beat volatility benchmark ([Hansen & Lunde 2005](https://doi.org/10.1002/jae.800)).
+
+### 3.6 Monte Carlo simulation
+
+For path $i=1..N$ and day $h=1..H$:
+
+1. regressors $X^{(i)}_h=\big(S^{(i)}_{h-1},\ x^{(i)}_{h}\big)$ with $x^{(i)}_1=x_T$ (actual) and afterwards a historical block read forward from a random start;
+2. $s^{2(i)}_h=\omega+\alpha(e^{(i)}_{h-1})^2+\beta s^{2(i)}_{h-1}$ with $(s_0^2,e_0)=(h_T,\eta_T)$ (scaled units);
+3. $e^{(i)}_h=\sqrt{s^{2(i)}_h}\,\tau^{(i)}_h\sqrt{(\nu-2)/\nu}$, $\tau\sim t_\nu$;
+4. $r^{(i)}_h=\hat\mu(X^{(i)}_h)+e^{(i)}_h/1000$;
+5. $S^{(i)}_h=\lambda\odot S^{(i)}_{h-1}+r^{(i)}_h\mathbf1$.
+
+**Initial-condition check.** `design` drops the last feature row (target unknown), so the final residual is $\eta_T=r_T-\hat\mu(X_{T-1})$ and the final GARCH $h$ is $h_T$. The first simulated update therefore produces $h_{T+1}=\omega+\alpha\eta_T^2+\beta h_T$, the correct one-step-ahead variance. The mode states and drives at day $T$ are the right conditioning set for forecasting day $T+1$.
+
+**Monte Carlo error.** The asymptotic standard error of an empirical $p$-quantile is $\sqrt{p(1-p)/N}\big/f(q_p)$. For $N=20{,}000$, $p=0.05$ and a unit-variance Gaussian forecast ($f(-1.645)=0.1031$): $0.001541/0.1031\approx0.0149$ sd — matching the code comment "$\approx0.015$". For a unit-variance $t_5$ forecast the density at the 5% quantile is lower ($\approx0.082$), giving $\approx0.019$ sd: the stated figure is a *Gaussian-case* value and is mildly optimistic for fat-tailed forecasts.
+
+**Scope of uncertainty (stated correctly in the script).** The ensemble captures innovation uncertainty and drive-path uncertainty. It treats $(\hat\beta,\hat\Omega,\hat\omega,\hat\alpha,\hat\beta_{G},\hat\nu)$ as exact; the resulting bands are *scenario ranges*, not calibrated confidence intervals. Parameter uncertainty can be propagated by bootstrap (e.g. [Pascual, Romo & Ruiz 2006](https://doi.org/10.1016/j.csda.2004.12.011)); for interval calibration tests see [Christoffersen (1998)](https://doi.org/10.2307/2527341).
+
+**Drift at long horizons.** The intercept $\hat b_0$ and the bootstrapped drive blocks inject the *sample mean* log-return into every simulated step. Over a 756-day dashboard horizon this converts historical average depreciation/appreciation (for USD/INR) or historical average price trend (Gold, Brent) into a deterministic tilt of the median band. That is a modelling choice, not an error, but it dominates long-horizon medians and should be read as "continuation of the sample drift".
+
+---
+
+## 4. Physical analysis (Mori–Zwanzig / GLE)
+
+### 4.1 The statistical-physics template
+
+For a resolved observable $A(t)$ of a larger deterministic system, projection-operator methods ([Zwanzig 1961](https://doi.org/10.1103/PhysRev.124.983); [Mori 1965](https://doi.org/10.1143/PTP.33.423)) yield the exact generalized Langevin equation
+
+$$
+\dot A(t)=i\Omega A(t)-\int_0^{t}K(t-s)A(s)\,ds+F(t),
+$$
+
+with $F$ evolving under the *orthogonal* dynamics and, for stationary equilibrium dynamics, the second fluctuation–dissipation relation $K(t)=\langle F(t)F(0)\rangle\langle A^2\rangle^{-1}$ ([Kubo 1966](https://doi.org/10.1088/0034-4885/29/1/306)). Optimal-prediction and data-driven applications: [Chorin, Hald & Kupferman 2000](https://doi.org/10.1073/pnas.97.7.2968); [Lei, Baker & Li 2016](https://doi.org/10.1073/pnas.1609587113).
+
+### 4.2 How the pipeline maps onto it
+
+| Physical object | Pipeline object | Status |
+|---|---|---|
+| Resolved variable $A$ | $r_t$ (return) | Direct |
+| Memory kernel $K(t-s)$ | $-K_k=-\sum_h\beta_h\lambda_h^{k}$ (sign convention aside) | Estimated, finite-parameter |
+| Externally applied "fields" $x_j$ | Drives $x_j(t)$ | Linear response ([Kubo](https://doi.org/10.1088/0034-4885/29/1/306)) with coefficients $\Omega_j$ |
+| Orthogonal-dynamics noise $F$ | Residual $\eta_t$ | **Not** orthogonal-dynamics noise; it is the regression residual with GARCH-$t$ structure |
+| FDT-2 | Not imposed | Correctly disclaimed in the script |
+
+### 4.3 Markovian embedding
+
+A kernel of the form $\sum_h\beta_h e^{-\gamma_h \tau}$ is equivalent to coupling the resolved variable to auxiliary linear degrees of freedom $s_h$ relaxing at rates $\gamma_h$ — the classical *Markovian embedding* of a memory kernel (used for colored-noise GLE thermostats and for approximating long-memory kernels by exponential sums; e.g. [Abi Jaber & El Euch 2019](https://doi.org/10.1137/18M1170236) for rough-volatility kernels). The discrete $\lambda_h=e^{-\gamma_h\Delta t}$ with $\gamma_h=\ln2/h$ per day. The stacked system $S(t+1)=AS(t)$ of §3.2 is precisely this embedding in discrete time, and "stability of $A$" is the discrete analogue of positivity/decay of the embedded dynamics.
+
+Related financial structures built on the same exponential-sum idea: Hawkes processes with exponential kernels ([Hardiman, Bercot & Bouchaud 2013](https://doi.org/10.1140/epjb/e2013-40107-3); [Bacry, Mastromatteo & Muzy 2015](https://doi.org/10.1142/S2382626615500057)), the HAR realized-volatility model whose daily/weekly/monthly averages are a coarse exponential family ([Corsi 2009](https://doi.org/10.1093/jjfinec/nbp001)), and propagator models for order-flow impact ([Bouchaud, Gefen, Potters & Wyart 2004](https://doi.org/10.1080/14697680400020325); [Lillo & Farmer 2004](https://doi.org/10.2202/1558-3708.1226)).
+
+### 4.4 Dimensional and scaling remarks
+
+$r$ is dimensionless; in continuous time $K(\tau)$ has units of 1/time, and the discrete tap is $K_k\approx K(k\Delta t)\Delta t$ (dimensionless per day). $\Omega_j$ carries units of (return)/(drive return) per day, i.e. dimensionless for log-return drives. Standardized coefficients are in return units per sd of the regressor.
+
+### 4.5 Rigorous reading
+
+* The Mori–Zwanzig derivation is exact for closed Hamiltonian systems with a known invariant measure; financial markets are open, non-Hamiltonian and non-stationary at long scales. The script's own caveats (no equilibrium, no FDT, no detailed balance, weak stationarity only) are therefore *necessary* for honesty, and they are present.
+* The discrete model is equivalently an **ARX($\infty$)** with a parametric kernel and conditionally heteroskedastic errors. Its identifiability statement — total linear dependence cannot be split into "memory" and "noise autocorrelation" from one trajectory — is correct (spectral factorization is unique only up to the choice of minimum-phase representation).
+* Because the same linear structure can be written as an ARMA-type filter, the choice between "memory $K$" and "serially correlated $\eta$" is a modelling convention, not an empirical fact.
+
+---
+
+## 5. Financial and economic analysis
+
+### 5.1 Efficient-markets baseline and what predictability can exist
+
+Under weak-form efficiency returns are unpredictable in mean ([Fama 1970](https://doi.org/10.2307/2325486); modern perspective [Timmermann & Granger 2004](https://doi.org/10.1016/S0169-2070(03)00012-8)). Small, time-varying predictability can coexist with efficiency through risk premia, frictions and intervention. Economically small $R^2$ values can still matter for portfolio decisions ([Campbell & Thompson 2008](https://doi.org/10.1093/rfs/hhm055)), but out-of-sample evidence is the standard ([Welch & Goyal 2008](https://doi.org/10.1093/rfs/hhm014)).
+
+**Implication for kernel signs.** $K_\Sigma>0$ = short-horizon momentum / time-series trend ([Moskowitz, Ooi & Pedersen 2012](https://doi.org/10.1016/j.jfineco.2011.11.003)); $K_\Sigma<0$ = reversal (liquidity provision, bid–ask bounce, official smoothing). Both are *total linear dependence* (§4.5).
+
+### 5.2 The random-walk benchmark in FX and its modern status
+
+[Meese & Rogoff (1983)](https://doi.org/10.1016/0022-1996(83)90017-X) showed structural FX models do not beat a random walk out of sample. Subsequent work refined, but did not overturn, the picture: [Rossi (2013)](https://doi.org/10.1257/jel.51.4.1063) surveys the evidence and its time-variation; [Engel & West (2005)](https://doi.org/10.1086/427467) explain why near-unit-root fundamentals make exchange rates look like random walks; [Rogoff & Stavrakeva (2008)](https://www.nber.org/papers/w14071) ✅ argue that reported gains were overstated through misinterpretation of nested-model tests, over-reliance on asymptotic statistics and insufficient window-robustness checks. **Each of those three criticisms maps onto a specific design feature of this pipeline** (non-asymptotic caution in the report text; window-robust *frozen-forward* and *nested chronological* validation; explicit nested-model handling). The multiple-testing exposure that remains is discussed in §6.6.
+
+### 5.3 Volatility and density: where reproducible skill usually is
+
+Volatility clustering is the most robust empirical regularity across FX, oil and gold ([Cont 2001](https://doi.org/10.1080/713665670)); GARCH(1,1) is a strong benchmark ([Hansen & Lunde 2005](https://doi.org/10.1002/jae.800)). For *distributional* forecasts, a conditional-variance model typically improves log score and CRPS against an unconditional benchmark even when the mean is unpredictable. Consequently:
+
+> In `evaluate_crps_horizons`, the `zero_return` and `expanding_drift` benchmarks are **unconditionally homoskedastic** (empirical historical cumulative returns, centred), whereas the `drives_only` and `modes_plus_drives` candidates carry GARCH-$t$ conditional variance. A CRPS gain of a candidate over `zero_return` therefore conflates (i) conditional-mean skill and (ii) volatility-clustering skill. The cleanest *mean-skill* comparison is `drives_only` vs `modes_plus_drives` (both GARCH-$t$), which is how the script reports "gain from memory".
+
+### 5.4 Asset-specific economic structure
+
+| | **USD/INR (FX)** | **Brent crude** | **Gold** |
+|---|---|---|---|
+| Regime | De facto managed float; central-bank intervention and regime shifts documented ([Zeileis, Shah & Patnaik](https://research.wu.ac.at/en/publications/testing-monitoring-and-dating-structural-changes-in-maximum-likel-3/) ✅, R package [`fxregime`](https://cran.r-project.org/web/packages/fxregime/index.html) ✅; "fear of floating": [Calvo & Reinhart 2002](https://doi.org/10.1162/003355302760193886); classification: [Reinhart & Rogoff 2004](https://doi.org/10.1162/003355304772839515)) | Global benchmark set by supply/demand shocks and expectations ([Kilian 2009](https://doi.org/10.1257/aer.99.3.1053)); price-level shifts driven by OPEC/geopolitics | Store of value; driven by real rates, dollar, risk aversion |
+| Typical economic drivers | USD strength, oil (India is a large net crude importer), risk appetite, rate differentials, flows | Global activity, inventories, spare capacity, USD | Real yields, USD, safe-haven demand |
+| Sign prior for $\Omega$ on $r_{\text{USDINR}}$ | $+$ for broad USD, $+$ for Brent (INR weakens when oil rises), $-$ for risk-on equities | — | — |
+| Data trap | Spot vs fixing vs NDF; trading-hour asynchrony (§5.5) | Futures-roll gaps and term-structure ([Gorton & Rouwenhorst 2006](https://doi.org/10.2469/faj.v62.n2.4083)); use a roll-adjusted continuous series, not a naive splice | Spot vs futures basis; fix vs close |
+| Mean predictability evidence | Weak ([Rossi 2013](https://doi.org/10.1257/jel.51.4.1063)) | Short-horizon gains over no-change are possible with fundamentals/VARs at monthly horizons, but daily gains are not robust ([Baumeister & Kilian 2015](https://ideas.repec.org:443/p/cpr/ceprdp/9569.html) ✅; [Alquist & Kilian 2010](https://doi.org/10.1002/jae.1159)) | Near random walk at daily frequency; hedge/safe-haven properties are conditional ([Baur & Lucey 2010](https://doi.org/10.1111/j.1540-6288.2010.00244.x); [Baur & McDermott 2010](https://doi.org/10.1016/j.jbankfin.2009.12.008); survey [O'Connor et al. 2015](https://doi.org/10.1016/j.irfa.2015.07.005); [Erb & Harvey 2013](https://doi.org/10.2469/faj.v69.n4.1)) |
+| Variance features | Moderate persistence, intervention-induced jumps | High volatility, regime clusters (supply shocks) | Lower volatility, high persistence, spikes in crisis |
+| Expected $\hat\nu$ | Moderate | Low (heavy tails) | Moderate |
+| Financialization/cross-asset | Linked to oil and USD | Linked to USD and risk sentiment ([Tang & Xiong 2012](https://doi.org/10.2469/faj.v68.n5.6)) | Linked to USD and real rates |
+
+*Rows describing expected parameter magnitudes are qualitative priors from the literature; they are **not** results of this pipeline.*
+
+### 5.5 Time-zone asynchrony (important for any lead–lag interpretation)
+
+The script correctly states that a surviving $\Omega_j$ is a *lead–lag association*, not structural causation. A concrete mechanism that can manufacture lead–lag without causation is **non-synchronous closes**: Asian equity closes precede, and U.S. equity/volatility closes follow, an Indian-session FX observation. A U.S. return dated $t$ can then be genuinely earlier than, or overlap with, part of the next FX return $r_{t+1}$. The construction is *causal* in the information sense (no regressor post-dates its target) — verified in §8 — but the economic reading of "oil leads INR" should be tempered by the sampling times of each series. For Gold/Brent (near-24h markets) the same issue arises with fixing/settlement times.
+
+### 5.6 Transformations of drives
+
+The drive columns are daily *log returns*. For the VIX and the U.S. 10-year yield this is a transformation of a *level* that is a ratio or a rate: log-changes of yields are not equal to basis-point changes and become distorted at low yield levels. The choice is internally coherent (all drives are in additive return units and are standardized), but the economic interpretation of $\Omega_{\text{us10y}}$ is "per sd of log-yield change". Likewise `broad_usd` includes INR with a small weight, producing mild endogeneity when the target is USD/INR; this should be kept in mind when interpreting its coefficient.
+
+### 5.7 Cumulative-return forecasting and horizon
+
+At $H>1$ the mean skill (if any) is overshadowed by variance growth ($\propto H$) while overlapping targets reduce the effective sample size by roughly $H$. The script's multi-horizon design (direct regression with purged training; CRPS with spaced origins and block bootstrap) is the right architecture for this.
+
+---
+
+## 6. Statistical analysis of the evaluation design
+
+### 6.1 Out-of-sample $R^2$ and nested-model testing
+
+$R^2_{\text{oos}}=1-\mathrm{SSE}_{\text{model}}/\mathrm{SSE}_{\text{zero}}$. Against a zero forecast this is the Campbell–Thompson-type statistic ([2008](https://doi.org/10.1093/rfs/hhm055)). Because the candidate contains the zero forecast as a special case, plain MSPE comparison is biased against the larger model; the Clark–West adjustment fixes this:
+
+$$
+f_t=(y-b)^2-\big[(y-a)^2-(b-a)^2\big]=2\,(y-b)(a-b),
+$$
+
+(algebra verified in §8) tested one-sided with Newey–West HAC variance ([Clark & West 2007](https://doi.org/10.1016/j.jeconom.2006.05.023); [Newey & West 1987](https://doi.org/10.2307/1913610)). Related: [Diebold & Mariano 1995](https://doi.org/10.1080/07350015.1995.10524599), [West 1996](https://doi.org/10.2307/2171864), [Giacomini & White 2006](https://doi.org/10.1111/j.1468-0262.2006.00718.x).
+
+**Validity qualifications (limitations, not errors).**
+* CW's "approximately normal" result is derived for OLS-estimated nested linear models; here the alternative is a *penalized, weighted, CV-tuned* estimator and the sample is *expanding*. Normal critical values are then approximate; [Rogoff & Stavrakeva (2008)](https://www.nber.org/papers/w14071) ✅ caution against over-reliance on asymptotic CW statistics. Bootstrap/window-robust checks ([Rossi & Inoue 2012](https://doi.org/10.1080/07350015.2012.663261)) are the remedy.
+* For $H>1$, the script uses HAC lag $H-1$, the standard choice for MA($H-1$) overlap, with the usual finite-sample caveat.
+
+### 6.2 Power
+
+Approximating the CW $t$-statistic by $t\approx\sqrt{nR^2_{\text{pop}}/(1-R^2_{\text{pop}})}$:
+
+| True $R^2$ | $n=1000$ | one-sided 5% power (Gaussian approx.) |
+|---|---|---|
+| 0.5% | $t\approx2.24$ | $\approx73\%$ |
+| 0.1% | $t\approx1.00$ | $\approx26\%$ |
+
+This supports the code's comment that $\sim$1000 OOS days are needed to detect $R^2\approx0.5\%$, and shows that smaller effects are essentially undetectable at daily frequency with a few years of data.
+
+### 6.3 Density evaluation
+
+* **PIT** $u_t=F_{t}(y_t)$ is i.i.d. $U(0,1)$ under a correctly specified one-step density ([Rosenblatt 1952]; [Diebold, Gunther & Tay 1998](https://doi.org/10.2307/2527342)). The code computes $u_t=F_{t_\nu}(z_t/\sqrt{(\nu-2)/\nu})$, consistent with the standardization.
+* **Log score** is strictly proper ([Gneiting & Raftery 2007](https://doi.org/10.1198/016214506000001437)). The code uses $\log f_{t_\nu}(z/ts)-\log ts-\tfrac12\log h_t$ with $ts=\sqrt{(\nu-2)/\nu}$ — correct Jacobian — and the benchmark $\log\mathcal N(x;0,s_0^2)$ in the same scaled units, so the *difference* is unit-free.
+* **KS test on PIT** treats PIT as i.i.d.; estimation error in frozen parameters and residual dependence make the p-value approximate. [Berkowitz (2001)](https://doi.org/10.1198/073500101316970395) tests are the more powerful alternative.
+* **Tail coverage** ($\Pr[u<0.05]$, $\Pr[u>0.95]$) is the unconditional part of [Christoffersen (1998)](https://doi.org/10.2307/2527341); a conditional-coverage (independence) test is not implemented.
+* **Diagnostics:** Ljung–Box ([1978](https://doi.org/10.1093/biomet/65.2.297)) on $z$ (mean dependence), ARCH-LM ([Engle 1982](https://doi.org/10.2307/1912773)) on $z$ (volatility dependence), OLS-CUSUM on demeaned $z$ ([Brown, Durbin & Evans 1975](https://doi.org/10.1111/j.2517-6161.1975.tb01532.x); [Ploberger & Krämer 1992](https://doi.org/10.2307/2951597)).
+* **Stationarity check.** The ADF test ([Dickey & Fuller 1979](https://doi.org/10.1080/01621459.1979.10482531)) rejects a unit root; it does not by itself verify constancy of the variance. The script's wording ("mean and variance of $r$ do not drift") is slightly broader than what ADF establishes; the GARCH persistence report and the CUSUM/ARCH diagnostics supply the missing evidence.
+
+### 6.4 CRPS
+
+$\mathrm{CRPS}(F,y)=\mathbb E|X-y|-\tfrac12\mathbb E|X-X'|$ is strictly proper ([Matheson & Winkler 1976](https://doi.org/10.1287/mnsc.22.10.1087); [Gneiting & Raftery 2007](https://doi.org/10.1198/016214506000001437)). For sorted ensemble members, $\sum_{i,j}|x_i-x_j|=2\sum_i(2i-n-1)x_{(i)}$, so $\tfrac12\mathbb E|X-X'|$ is $\sum_i(2i-n-1)x_{(i)}/n^2$ — exactly the code's expression (the V-statistic). Using the "fair" $n(n-1)$ denominator ([Ferro 2014](https://doi.org/10.1002/qj.2270)) changes all models' scores by the same small factor because every ensemble has the same $n$; ranking and differences are unaffected to first order. See also [Hersbach 2000](https://doi.org/10.1175/1520-0434(2000)015%3C0559:DOTCRP%3E2.0.CO;2).
+
+Moving-block bootstrap for score differences ([Künsch 1989](https://doi.org/10.1214/aos/1176347265); block-length guidance [Politis & White 2004](https://doi.org/10.1081/ETC-120028836)) is appropriate; with $H\le21$ and origin stride 20 the chosen block length ($\max(2,\lceil H/\text{stride}\rceil)=2$) matches the weak overlap.
+
+### 6.5 Leakage audit (all verified)
+
+| Check | Result |
+|---|---|
+| Features at row $t$ use only information through day $t$ | ✔ (mode states are causal filters; drives aligned by cumulative-sum differencing) |
+| Target row $t$ is $r_{t+1}$ | ✔ (`shift(-1)`) |
+| Walk-forward training stops strictly before the test block | ✔ (`X.iloc[:start+s]`) |
+| Expanding-mean benchmark excludes the contemporaneous target | ✔ (`shift(1)` of the expanding mean of $y$ gives $\bar y_{0..t-1}=\overline{r_{1..t}}$) |
+| Multi-horizon purging | ✔ (`train_end = first_test_pos − H + 1`; row $\text{pos}-H$ has its target mature at $\text{pos}$, known at the origin) |
+| Density parameters frozen on training data; variance filtered with past OOS errors only | ✔ |
+| CRPS origins leave $H$ future observations; fits use `feats.iloc[:origin+1]` only | ✔ |
+| Hyper-parameters re-selected inside every walk-forward refit | ✔ |
+
+### 6.6 Researcher degrees of freedom
+
+The suite contains several correlated variants (penalty multipliers $\{1,0.3,0.1,0.03,0.01\}$, horizons 1/5/21, several tests). Selecting the best of these on the same outcomes inflates apparent skill ([White 2000](https://doi.org/10.1111/1468-0262.00152); [Hansen 2005](https://doi.org/10.1198/073500105000000063); [Harvey, Liu & Zhu 2016](https://doi.org/10.1093/rfs/hhv059); [Bailey, Borwein, López de Prado & Zhu 2017](https://doi.org/10.21314/JCF.2016.322)). The **nested chronological validation** and the **frozen forward evaluation** are exactly the right countermeasures: the selection period fixes the multiplier, the later hold-out or post-cutoff window scores it once. They are valid *only if* the cutoff and multiplier are fixed before examining post-cutoff outcomes, which the script states; with fewer than 20 origins the script correctly labels results preliminary. Note the default `--frozen-cutoff 2026-10-16` leaves, as of 2026-10-30, at most a handful of 5-day non-overlapping origins; the output will be preliminary unless the data are refreshed and the test is re-run later.
+
+---
+
+## 7. Computational and data analysis
+
+### 7.1 Data alignment (the central data-engineering step)
+
+Per drive: cumulative sum of log-returns on its own calendar $\to$ forward-fill onto the INR calendar $\to$ first difference. Because log-returns add, this yields the *exact* drive return over $(t_{\text{prev}},t]$: moves on days when the INR calendar is closed are carried into the next INR day; a drive that is closed on an INR day contributes 0. Missing driver values are treated as zero contributions and counted in `DATA_QUALITY`; the run aborts if any drive is missing on more than 10% of INR dates. The design is sound and the policy is disclosed. Limitation: "missing" and "holiday" are not distinguished (§9).
+
+### 7.2 Complexity
+
+| Stage | Cost (approx.) |
+|---|---|
+| Mode states | $O(n|\mathcal H|)$ via `lfilter` |
+| ElasticNetCV | $O\big(|\rho\text{-grid}|\cdot N_\alpha\cdot K_{\text{folds}}\cdot\text{iters}\cdot n p\big)$ with $p=|\mathcal H|+|\text{drives}|=12$ |
+| GARCH-$t$ | iterative ML, $O(n)$ per likelihood evaluation |
+| Simulation | $O(N\cdot H\cdot p)$ plus one vectorized `predict` per day |
+| Walk-forward | (test window / refit interval) × (CV + GARCH) |
+| CRPS | $|\text{horizons}|\times|\text{origins}|\times2$ fits + simulations; $O(n\log n)$ CRPS per ensemble |
+
+Memory is dominated by $N\times p$ arrays: trivial at $N=20{,}000$.
+
+### 7.3 Numerical conditioning
+
+The ×1000 scaling brings residuals to order 1–10 for the `arch` optimizer; because the scaling is a pure change of units, estimates are equivariant. The 1e-12 variance floor in the CRPS simulator protects against underflow; the main simulator relies on $\omega>0$.
+
+### 7.4 Reproducibility
+
+Seeded `numpy.random.default_rng` (PCG64) is used throughout; ensembles for different origins/models use deterministic seed offsets. Library versions should be pinned (scikit-learn $\ge1.7$ per the header). Software: [scikit-learn (Pedregosa et al. 2011)](https://jmlr.org/papers/v12/pedregosa11a.html), [statsmodels (Seabold & Perktold 2010)](https://doi.org/10.25080/Majora-92bf1922-011), [SciPy (Virtanen et al. 2020)](https://doi.org/10.1038/s41592-019-0686-2), [NumPy (Harris et al. 2020)](https://doi.org/10.1038/s41586-020-2649-2), [`arch` (Sheppard)](https://github.com/bashtage/arch).
+
+### 7.5 Multi-asset dashboard
+
+* USD/INR: this GLE/VARX pipeline run as a subprocess (`--skip-eval`, 500 paths).
+* Gold, Brent: independent **moving-block bootstrap** (block 5) of each asset's own historical log-returns, $P_h=P_T\exp(\sum_{i\le h}r^{*}_i)$ — a *scenario baseline* with no mean model and implicitly the sample drift.
+* Cross-asset analysis: Pearson correlation of same-date log-returns and the latest rolling-60D correlation (≥40 common points). Descriptive only; **the three forecasts are simulated independently**, so the dashboard does not impose these correlations on the forecasts.
+* The thin paths and the terminal histogram in the browser are **regenerated from the stored P05/P50/P95** using smoothed Gaussian noise (marginal sd $=(p_{95}-p_{05})/3.29$); the page states this. The terminal histogram is therefore a *Gaussian-shaped visual approximation*, not the model's terminal distribution (which is skewed in price space and fat-tailed in return space).
+
+---
+
+## 8. Verification ledger
+
+Items re-derived or numerically sanity-checked against the code text and found **consistent**:
+
+| # | Item | Verification |
+|---|---|---|
+| 1 | Kernel $K_k=\sum_h\beta_h\lambda_h^k$ and kernel sum $\sum_h\beta_h/(1-\lambda_h)$ | Geometric series; index convention consistent between code and synthetic-truth recovery |
+| 2 | $A=\operatorname{diag}(\lambda)+\mathbf1\beta^\top$ from $S(t+1)=\lambda S(t)+r_{t+1}\mathbf1$, $r_{t+1}=\beta^\top S(t)$ | Direct substitution; $\det$ via matrix determinant lemma |
+| 3 | $\beta^{\text{raw}}=\beta^{\text{std}}/\text{scale}$ | Target unscaled, regressors standardized |
+| 4 | IRLS weight $w=(\nu+1)/((\nu-2+z^2)h)$ for unit-variance $t$ | EM scale-mixture derivation (§3.4) |
+| 5 | Clark–West $f_t=2(y-b)(a-b)$ | Expand $(y-b)^2-(y-a)^2+(b-a)^2$ |
+| 6 | Closed-form CRPS term $\sum(2i-n-1)x_{(i)}/n^2$ | $\sum_{i,j}|x_i-x_j|=2\sum_i(2i-n-1)x_{(i)}$ |
+| 7 | PIT $=F_{t_\nu}(z/ts)$, log-score Jacobian $-\log ts-\tfrac12\log h$ | Change-of-variables for $x=\sqrt h\,ts\,T$ |
+| 8 | Simulation initial condition ($h_T,\eta_T\to h_{T+1}$) | `design` drops last feature row ⇒ last residual is $\eta_T$ |
+| 9 | Purging index $\text{pos}-H+1$ | Target windows end at the origin, not beyond |
+| 10 | Drift benchmark causality | `expanding().mean().shift(1)` |
+| 11 | MC quantile error $\approx0.015$ sd ($N=20{,}000$, $p=5\%$, Gaussian) | $\sqrt{p(1-p)/N}/f(q)=0.00154/0.1031$ |
+| 12 | $\sim$1000 OOS days for $R^2\approx0.5\%$ | $t\approx2.24$ ⇒ $\approx73\%$ one-sided power |
+
+---
+
+## 9. Implementation observations and limitations
+
+These are stated precisely so that they can be fixed or documented. None changes the conclusions of §1.
+
+**Observations about the code (verifiable by reading it):**
+
+1. **Dashboard accuracy panel label.** The metrics dictionary key for the drives-only model is `"enet, drives only"`, while the dashboard JavaScript iterates over `"enet, no memory kernel"`. That row is therefore not displayed (the loop silently skips missing keys). Aligning the label restores it.
+2. **Stability guard scope.** The guard is applied to the production fit in `fit_varx` only. Models fitted in `walk_forward`, the horizon evaluations and the CRPS simulations use `fit_weighted` without the guard; the guard also rescales `coef_` without re-centring `intercept_` (with non-uniform weights the weighted mean of standardized columns need not be exactly zero). Both effects are second-order unless the fitted $\rho(A)$ is near 1.
+3. **CRPS origin alignment.** `model_scores` lists are appended per origin; if an origin is skipped *after* the benchmark scores are appended but *before* the model scores, the lists differ in length and the code aligns them by truncating from the head, which would misalign origins. The condition (`len(Xtrain) < max(100, 10p)`) is not triggered at the default settings but could be with very short samples or very large `--crps-test-window`.
+4. **Cross-validation details.** The `StandardScaler` is fitted on the full training set before `ElasticNetCV` splits it, so fold validation sets share scaling statistics with their training folds (a mild, common simplification). The way `sample_weight` enters the CV validation score is version-dependent in scikit-learn and should be checked against the installed version's documentation.
+5. **Overlapping horizons.** In the direct multi-horizon regression, the CV folds are not purged internally and the GARCH-$t$ weights are built from a daily-noise model but applied to overlapping $H$-day residuals (MA($H-1$) dependence). Hyper-parameter selection and weights at $H>1$ are therefore approximate.
+6. **Static interpretive text.** The dashboard card "The current run has not established a convincing predictive advantage over a zero-return baseline" is hard-coded; it does not change with results.
+7. **Calendar.** Forecast dates use `bdate_range` (Monday–Friday) with no exchange-holiday calendar; `--target-date` rejects weekends but not holidays; the code states this.
+8. **Undocumented inputs.** `--build-dashboard` requires a `brent_oil_level` column in the market file and a separate gold CSV; the module header's INPUTS section lists neither.
+9. **Self-inclusion.** `DRIVES` contains Brent and Gold; if either is used as the *target* the corresponding column must be removed (§2.2).
+10. **Burn-in wording.** 450 days is five half-lives of the longest mode (3.1% truncated weight), not "$\gg$" 90.
+
+**Conceptual limitations (inherent to the model class):**
+
+* Linear mean with constant coefficients over each estimation window; no regime or time-varying parameters (a Kalman/TVP or regime model would be needed for structural breaks — [Hamilton 1989](https://doi.org/10.2307/1912559); also window-selection issues in [Pesaran & Timmermann 2007](https://doi.org/10.1016/j.jeconom.2006.03.007)).
+* Symmetric GARCH(1,1): no leverage or asymmetry ([Glosten, Jagannathan & Runkle 1993](https://doi.org/10.1111/j.1540-6261.1993.tb05128.x); [Nelson 1991](https://doi.org/10.2307/2938260)); symmetric $t$: no skew ([Hansen 1994](https://doi.org/10.2307/2527081)).
+* Drives are bootstrapped independently of the simulated target and without feedback from the target to the drives; cross-sectional dependence between drives and target innovations is not modelled jointly.
+* Parameter uncertainty is not propagated; bands are scenario ranges.
+* Inference after selection (post-lasso) is not provided.
+* Single-asset conditional model; multi-asset forecasts are independent.
+
+---
+
+## 10. Extensions and recommendations
+
+1. **Window-robust inference:** add Rossi–Inoue window-robust OOS tests ([2012](https://doi.org/10.1080/07350015.2012.663261)) and Harvey–Leybourne–Newbold small-sample DM adjustment ([1997](https://doi.org/10.1016/S0169-2070(96)00719-4)).
+2. **Forecast-set comparison:** replace pairwise selection by the Model Confidence Set ([Hansen, Lunde & Nason 2011](https://doi.org/10.3982/ECTA5771)).
+3. **Density:** skew-$t$ / GJR-GARCH, realized-variance regressors (HAR; [Corsi 2009](https://doi.org/10.1093/jjfinec/nbp001)), Berkowitz tests, conditional-coverage tests, and parameter-uncertainty bootstrap.
+4. **Joint scenario generation:** bootstrap *rows* of $(r_t,x_t)$ in blocks ([Künsch 1989](https://doi.org/10.1214/aos/1176347265), [Politis & Romano 1994](https://doi.org/10.1080/01621459.1994.10476870)) to retain the target–drive dependence; build a multivariate (e.g. copula/DCC; [Bollerslev, Chou & Kroner 1992](https://doi.org/10.1016/0304-4076(92)90064-X)) model for the three-asset dashboard.
+5. **Selection stability:** report stability-selection frequencies ([Meinshausen & Bühlmann 2010](https://doi.org/10.1111/j.1467-9868.2010.00740.x)).
+6. **Purged CV** with embargo for overlapping targets.
+7. **Asset-specific drives:** FX — rate differentials, intervention proxies; Brent — term-structure slope/inventories; Gold — real yields. Use roll-adjusted Brent futures.
+8. **Reporting:** make the dashboard's cautionary text conditional on the actual CW/KS/CUSUM results.
+
+---
+
+## 11. Reproducibility checklist
+
+- [ ] Pin: `python`, `numpy`, `pandas`, `scipy`, `scikit-learn>=1.7`, `statsmodels`, `arch`.
+- [ ] Commit `usd_inr.csv`, `market_drives.csv` (or a hash and acquisition script); document data sources, series definitions, time zones.
+- [ ] Record the seed (`--seed`) and command line used for each reported run.
+- [ ] Freeze the cutoff and multiplier **before** running forward evaluation; archive the outputs.
+- [ ] Run `--demo`, `--demo-null`, `--demo-slow` as regression tests (known ground truth; null fixture should show no skill).
+- [ ] Add a link-check and unit tests for: CW algebra, CRPS closed form, stability matrix, IRLS weights, purging indices.
+
+---
+
+## 12. References
+
+Links ✅ were opened and confirmed during preparation; other DOIs come from standard bibliographic records and should be link-checked.
+
+### Physics / projection operators / memory kernels
+- Zwanzig, R. (1961). Memory effects in irreversible thermodynamics. *Phys. Rev.* 124, 983. https://doi.org/10.1103/PhysRev.124.983
+- Mori, H. (1965). Transport, collective motion, and Brownian motion. *Prog. Theor. Phys.* 33, 423. https://doi.org/10.1143/PTP.33.423
+- Kubo, R. (1966). The fluctuation–dissipation theorem. *Rep. Prog. Phys.* 29, 255. https://doi.org/10.1088/0034-4885/29/1/306
+- Chorin, A., Hald, O., Kupferman, R. (2000). Optimal prediction and the Mori–Zwanzig representation of irreversible processes. *PNAS* 97, 2968. https://doi.org/10.1073/pnas.97.7.2968
+- Lei, H., Baker, N., Li, X. (2016). Data-driven parameterization of the generalized Langevin equation. *PNAS* 113, 14183. https://doi.org/10.1073/pnas.1609587113
+- Abi Jaber, E., El Euch, O. (2019). Multifactor approximation of rough volatility models. *SIAM J. Financial Math.* 10, 309. https://doi.org/10.1137/18M1170236
+
+### Econophysics / market microstructure
+- Cont, R. (2001). Empirical properties of asset returns: stylized facts. *Quant. Finance* 1, 223. https://doi.org/10.1080/713665670
+- Bouchaud, J.-P., Gefen, Y., Potters, M., Wyart, M. (2004). Fluctuations and response in financial markets. *Quant. Finance* 4, 176. https://doi.org/10.1080/14697680400020325
+- Lillo, F., Farmer, J. D. (2004). The long memory of the efficient market. *Stud. Nonlinear Dyn. Econom.* 8(3). https://doi.org/10.2202/1558-3708.1226
+- Hardiman, S., Bercot, N., Bouchaud, J.-P. (2013). Critical reflexivity in financial markets: a Hawkes process analysis. *Eur. Phys. J. B* 86, 442. https://doi.org/10.1140/epjb/e2013-40107-3
+- Bacry, E., Mastromatteo, I., Muzy, J.-F. (2015). Hawkes processes in finance. *Market Microstructure and Liquidity* 1. https://doi.org/10.1142/S2382626615500057
+- Corsi, F. (2009). A simple approximate long-memory model of realized volatility. *J. Financial Econometrics* 7, 174. https://doi.org/10.1093/jjfinec/nbp001
+
+### Regularized regression and time-series learning
+- Tibshirani, R. (1996). Regression shrinkage and selection via the lasso. *JRSS B* 58, 267. https://doi.org/10.1111/j.2517-6161.1996.tb02080.x
+- Zou, H., Hastie, T. (2005). Regularization and variable selection via the elastic net. *JRSS B* 67, 301. https://doi.org/10.1111/j.1467-9868.2005.00503.x
+- Friedman, J., Hastie, T., Tibshirani, R. (2010). Regularization paths for GLMs via coordinate descent. *J. Stat. Softw.* 33(1). https://doi.org/10.18637/jss.v033.i01
+- Zhao, P., Yu, B. (2006). On model selection consistency of lasso. *JMLR* 7, 2541. https://jmlr.org/papers/v7/zhao06a.html
+- Meinshausen, N., Bühlmann, P. (2010). Stability selection. *JRSS B* 72, 417. https://doi.org/10.1111/j.1467-9868.2010.00740.x
+- Basu, S., Michailidis, G. (2015). Regularized estimation in sparse high-dimensional time series models. *Ann. Stat.* 43, 1535. https://doi.org/10.1214/15-AOS1315
+- Wong, K. C., Li, Z., Tewari, A. (2020). Lasso guarantees for β-mixing heavy-tailed time series. *Ann. Stat.* 48, 1124. https://doi.org/10.1214/19-AOS1815
+- Bergmeir, C., Hyndman, R., Koo, B. (2018). A note on the validity of cross-validation for evaluating autoregressive time series prediction. *CSDA* 120, 70. https://doi.org/10.1016/j.csda.2017.11.003
+- Lange, K., Little, R., Taylor, J. (1989). Robust statistical modeling using the t distribution. *JASA* 84, 881. https://doi.org/10.1080/01621459.1989.10478852
+
+### Volatility
+- Engle, R. (1982). ARCH. *Econometrica* 50, 987. https://doi.org/10.2307/1912773
+- Bollerslev, T. (1986). GARCH. *J. Econometrics* 31, 307. https://doi.org/10.1016/0304-4076(86)90063-1
+- Bollerslev, T. (1987). A conditionally heteroskedastic time series model for speculative prices and rates of return. *Rev. Econ. Stat.* 69, 542. https://doi.org/10.2307/1925546
+- Engle, R., Bollerslev, T. (1986). Modelling the persistence of conditional variances. *Econometric Reviews* 5, 1. https://doi.org/10.1080/07474938608800095
+- Bollerslev, T., Wooldridge, J. (1992). Quasi-maximum likelihood estimation and inference in dynamic models with time-varying covariances. *Econometric Reviews* 11, 143. https://doi.org/10.1080/07474939208800229
+- Bollerslev, T., Chou, R., Kroner, K. (1992). ARCH modeling in finance. *J. Econometrics* 52, 5. https://doi.org/10.1016/0304-4076(92)90064-X
+- Hansen, P. R., Lunde, A. (2005). A forecast comparison of volatility models: does anything beat a GARCH(1,1)? *J. Applied Econometrics* 20, 873. https://doi.org/10.1002/jae.800
+- Nelson, D. (1991). Conditional heteroskedasticity in asset returns: a new approach. *Econometrica* 59, 347. https://doi.org/10.2307/2938260
+- Glosten, L., Jagannathan, R., Runkle, D. (1993). *J. Finance* 48, 1779. https://doi.org/10.1111/j.1540-6261.1993.tb05128.x
+- Hansen, B. (1994). Autoregressive conditional density estimation. *Int. Econ. Rev.* 35, 705. https://doi.org/10.2307/2527081
+- Hamilton, J. (1989). A new approach to the economic analysis of nonstationary time series and the business cycle. *Econometrica* 57, 357. https://doi.org/10.2307/1912559
+
+### Predictability, market efficiency, FX
+- Fama, E. (1970). Efficient capital markets. *J. Finance* 25, 383. https://doi.org/10.2307/2325486
+- Lo, A., MacKinlay, A. C. (1988). Stock market prices do not follow random walks. *Rev. Financial Studies* 1, 41. https://doi.org/10.1093/rfs/1.1.41
+- Timmermann, A., Granger, C. (2004). Efficient market hypothesis and forecasting. *Int. J. Forecasting* 20, 15. https://doi.org/10.1016/S0169-2070(03)00012-8
+- Welch, I., Goyal, A. (2008). A comprehensive look at the empirical performance of equity premium prediction. *Rev. Financial Studies* 21, 1455. https://doi.org/10.1093/rfs/hhm014
+- Campbell, J. Y., Thompson, S. (2008). Predicting excess stock returns out of sample. *Rev. Financial Studies* 21, 1509. https://doi.org/10.1093/rfs/hhm055
+- Moskowitz, T., Ooi, Y. H., Pedersen, L. (2012). Time series momentum. *J. Financial Economics* 104, 228. https://doi.org/10.1016/j.jfineco.2011.11.003
+- Meese, R., Rogoff, K. (1983). Empirical exchange rate models of the seventies. *J. Int. Economics* 14, 3. https://doi.org/10.1016/0022-1996(83)90017-X
+- Engel, C., West, K. (2005). Exchange rates and fundamentals. *J. Political Economy* 113, 485. https://doi.org/10.1086/427467
+- Rossi, B. (2013). Exchange rate predictability. *J. Economic Literature* 51, 1063. https://doi.org/10.1257/jel.51.4.1063
+- Rogoff, K., Stavrakeva, V. (2008). The continuing puzzle of short horizon exchange rate forecasting. NBER WP 14071. https://www.nber.org/papers/w14071 ✅
+- Calvo, G., Reinhart, C. (2002). Fear of floating. *QJE* 117, 379. https://doi.org/10.1162/003355302760193886
+- Reinhart, C., Rogoff, K. (2004). The modern history of exchange rate arrangements: a reinterpretation. *QJE* 119, 1. https://doi.org/10.1162/003355304772839515
+- Zeileis, A., Shah, A., Patnaik, I. (2010). Testing, monitoring, and dating structural changes in exchange rate regimes. *Computational Statistics & Data Analysis* 54(6), 1696–1706. Working-paper version: https://research.wu.ac.at/en/publications/testing-monitoring-and-dating-structural-changes-in-maximum-likel-3/ ✅ · Software: https://cran.r-project.org/web/packages/fxregime/index.html ✅
+
+### Oil (Brent) and commodities
+- Kilian, L. (2009). Not all oil price shocks are alike. *AER* 99, 1053. https://doi.org/10.1257/aer.99.3.1053
+- Alquist, R., Kilian, L. (2010). What do we learn from the price of crude oil futures? *J. Applied Econometrics* 25, 539. https://doi.org/10.1002/jae.1159
+- Baumeister, C., Kilian, L. (2015). Forecasting the real price of oil in a changing world: a forecast combination approach. *JBES* 33(3), 338–351. Working paper: https://ideas.repec.org:443/p/cpr/ceprdp/9569.html ✅ · https://repec.cepr.org/repec/cpr/ceprdp/DP9569.pdf ✅
+- Garratt, A., Vahey, S., Zhang, Y. (2019). Real-time forecast combinations for the oil price. *J. Applied Econometrics* (extends B&K to Brent): https://researchportalplus.anu.edu.au/en/publications/real-time-forecast-combinations-for-the-oil-price/ ✅
+- Gorton, G., Rouwenhorst, K. G. (2006). Facts and fantasies about commodity futures. *Financial Analysts J.* 62(2), 47. https://doi.org/10.2469/faj.v62.n2.4083
+- Tang, K., Xiong, W. (2012). Index investment and the financialization of commodities. *Financial Analysts J.* 68(5), 54. https://doi.org/10.2469/faj.v68.n5.6
+
+### Gold
+- Baur, D., Lucey, B. (2010). Is gold a hedge or a safe haven? *Financial Review* 45, 217. https://doi.org/10.1111/j.1540-6288.2010.00244.x
+- Baur, D., McDermott, T. (2010). Is gold a safe haven? International evidence. *J. Banking & Finance* 34, 1886. https://doi.org/10.1016/j.jbankfin.2009.12.008
+- Erb, C., Harvey, C. (2013). The golden dilemma. *Financial Analysts J.* 69(4), 10. https://doi.org/10.2469/faj.v69.n4.1
+- O'Connor, F., Lucey, B., Batten, J., Baur, D. (2015). The financial economics of gold — a survey. *Int. Rev. Financial Analysis* 41, 186. https://doi.org/10.1016/j.irfa.2015.07.005
+
+### Forecast evaluation
+- Diebold, F., Mariano, R. (1995). Comparing predictive accuracy. *JBES* 13, 253. https://doi.org/10.1080/07350015.1995.10524599
+- West, K. (1996). Asymptotic inference about predictive ability. *Econometrica* 64, 1067. https://doi.org/10.2307/2171864
+- Harvey, D., Leybourne, S., Newbold, P. (1997). Testing the equality of prediction mean squared errors. *Int. J. Forecasting* 13, 281. https://doi.org/10.1016/S0169-2070(96)00719-4
+- Clark, T., West, K. (2007). Approximately normal tests for equal predictive accuracy in nested models. *J. Econometrics* 138, 291. https://doi.org/10.1016/j.jeconom.2006.05.023
+- Giacomini, R., White, H. (2006). Tests of conditional predictive ability. *Econometrica* 74, 1545. https://doi.org/10.1111/j.1468-0262.2006.00718.x
+- Rossi, B., Inoue, A. (2012). Out-of-sample forecast tests robust to the choice of window size. *JBES* 30, 432. https://doi.org/10.1080/07350015.2012.663261
+- Pesaran, M. H., Timmermann, A. (2007). Selection of estimation window in the presence of breaks. *J. Econometrics* 137, 134. https://doi.org/10.1016/j.jeconom.2006.03.007
+- Newey, W., West, K. (1987). A simple, positive semi-definite, heteroskedasticity and autocorrelation consistent covariance matrix. *Econometrica* 55, 703. https://doi.org/10.2307/1913610
+- Diebold, F., Gunther, T., Tay, A. (1998). Evaluating density forecasts. *Int. Econ. Rev.* 39, 863. https://doi.org/10.2307/2527342
+- Berkowitz, J. (2001). Testing density forecasts. *JBES* 19, 465. https://doi.org/10.1198/073500101316970395
+- Christoffersen, P. (1998). Evaluating interval forecasts. *Int. Econ. Rev.* 39, 841. https://doi.org/10.2307/2527341
+- Gneiting, T., Raftery, A. (2007). Strictly proper scoring rules, prediction, and estimation. *JASA* 102, 359. https://doi.org/10.1198/016214506000001437
+- Matheson, J., Winkler, R. (1976). Scoring rules for continuous probability distributions. *Management Science* 22, 1087. https://doi.org/10.1287/mnsc.22.10.1087
+- Hersbach, H. (2000). Decomposition of the continuous ranked probability score for ensemble prediction systems. *Weather & Forecasting* 15, 559. https://doi.org/10.1175/1520-0434(2000)015%3C0559:DOTCRP%3E2.0.CO;2
+- Ferro, C. (2014). Fair scores for ensemble forecasts. *QJRMS* 140, 1917. https://doi.org/10.1002/qj.2270
+- Ljung, G., Box, G. (1978). On a measure of lack of fit in time series models. *Biometrika* 65, 297. https://doi.org/10.1093/biomet/65.2.297
+- Dickey, D., Fuller, W. (1979). *JASA* 74, 427. https://doi.org/10.1080/01621459.1979.10482531
+- Brown, R., Durbin, J., Evans, J. (1975). Techniques for testing the constancy of regression relationships over time. *JRSS B* 37, 149. https://doi.org/10.1111/j.2517-6161.1975.tb01532.x
+- Ploberger, W., Krämer, W. (1992). The CUSUM test with OLS residuals. *Econometrica* 60, 271. https://doi.org/10.2307/2951597
+
+### Bootstrap, simulation, multiple testing
+- Künsch, H. (1989). The jackknife and the bootstrap for general stationary observations. *Ann. Stat.* 17, 1217. https://doi.org/10.1214/aos/1176347265
+- Politis, D., Romano, J. (1994). The stationary bootstrap. *JASA* 89, 1303. https://doi.org/10.1080/01621459.1994.10476870
+- Politis, D., White, H. (2004). Automatic block-length selection for the dependent bootstrap. *Econometric Reviews* 23, 53. https://doi.org/10.1081/ETC-120028836
+- Pascual, L., Romo, J., Ruiz, E. (2006). Bootstrap prediction for returns and volatilities in GARCH models. *CSDA* 50, 2293. https://doi.org/10.1016/j.csda.2004.12.011
+- White, H. (2000). A reality check for data snooping. *Econometrica* 68, 1097. https://doi.org/10.1111/1468-0262.00152
+- Hansen, P. R. (2005). A test for superior predictive ability. *JBES* 23, 365. https://doi.org/10.1198/073500105000000063
+- Hansen, P. R., Lunde, A., Nason, J. (2011). The model confidence set. *Econometrica* 79, 453. https://doi.org/10.3982/ECTA5771
+- Harvey, C., Liu, Y., Zhu, H. (2016). …and the cross-section of expected returns. *Rev. Financial Studies* 29, 5. https://doi.org/10.1093/rfs/hhv059
+- Bailey, D., Borwein, J., López de Prado, M., Zhu, Q. J. (2017). The probability of backtest overfitting. *J. Computational Finance* 20(4). https://doi.org/10.21314/JCF.2016.322
+
+### Software
+- Pedregosa et al. (2011). Scikit-learn. *JMLR* 12, 2825. https://jmlr.org/papers/v12/pedregosa11a.html
+- Seabold, S., Perktold, J. (2010). Statsmodels. *Proc. SciPy*. https://doi.org/10.25080/Majora-92bf1922-011
+- Virtanen et al. (2020). SciPy 1.0. *Nature Methods* 17, 261. https://doi.org/10.1038/s41592-019-0686-2
+- Harris et al. (2020). Array programming with NumPy. *Nature* 585, 357. https://doi.org/10.1038/s41586-020-2649-2
+- Sheppard, K. `arch` package. https://github.com/bashtage/arch
+
+*Reference not given a DOI link above: Rosenblatt, M. (1952). Remarks on a multivariate transformation. Ann. Math. Statist. 23, 470–472.*
